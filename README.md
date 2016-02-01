@@ -11,6 +11,8 @@ To build, run:
 
 #Usage
 
+nitm must be run as root.
+
     nitm <interface> <ip_target_one> <ip_target_two>
     e.g. nitm eth0 192.168.0.1 192.168.0.7
     
@@ -18,7 +20,7 @@ if you dont provide an interface, it will automatically be selected.
 
     nitm <ip_target_one> <ip_target_two>
     e.g. nitm 192.168.0.1 192.168.0.7
-    
+
 These commands will ARP spoof <code>192.168.0.1</code> and <code>192.168.0.7</code>. All received packets will be piped pack into the network.
 
 #License
