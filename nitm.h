@@ -1,5 +1,5 @@
-#ifndef _MAILSNIFFER_H
-#define _MAILSNIFFER_H
+#ifndef _NITM_H
+#define _NITM_H
 
 struct etherhdr {
 	u_int8_t  ether_dhost[ETHER_ADDR_LEN];	/* destination eth addr	*/
@@ -8,4 +8,4 @@ struct etherhdr {
 };
 
 
-#endif //_MAILSNIFFER_H
+#endif //_NITM_H
