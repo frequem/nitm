@@ -2,7 +2,7 @@ EXEC_NAME = nitm
 OBJ_FILES = nitm.o
  
 INCLUDES = -I.
-LIBS = -lnet -lpcap -lpthread
+LIBS = -lnet
 LIBS_DIR = -L.
 CC = gcc
 CFLAGS =
